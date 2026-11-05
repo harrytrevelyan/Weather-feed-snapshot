@@ -1,0 +1,88 @@
+# .github/workflows/feed-snapshot.yml
+# Fetches the ITV forecast feed for the Weather prototype's fixed locations and
+# for every place in places.json, then commits the raw responses as
+# feed-snapshot.json. Keys are "lat,lng" at 2 dp, the same rounding the
+# prototype's fetchFeed uses. The place list is copied into the snapshot too, so
+# the prototype's offline search reads the same list the forecasts were fetched for.
+name: Feed snapshot
+
+on:
+  schedule:
+    - cron: '7 * * * *'   # hourly, off the top of the hour
+  workflow_dispatch: {}
+  push:
+    paths: ['places.json']   # refetch at once when the list changes
+
+permissions:
+  contents: write
+
+concurrency:
+  group: feed-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main          # the branch as it is now, not the commit that triggered the run
+
+      - name: Fetch feed
+        run: |
+          python3 - <<'PY'
+          import json, time, urllib.request, datetime
+          FEED = 'https://weather.prd.shows.itv.com/weather/forecast'
+          FIXED = {                       # keep in step with app/lib/api.jsx + constants.jsx
+            'W12 (current location)': (51.5085, -0.2360),
+            'London':                 (51.5072, -0.1276),
+            'Sydney':                 (-33.8688, 151.2093),
+            'New Delhi':              (28.6139, 77.2090),
+            'Stanley':                (-51.6938, -57.8569),
+            'Los Angeles':            (34.0522, -118.2437),
+            'National reference':     (51.51, -0.13),
+          }
+          places = json.load(open('places.json'))
+          todo = {}
+          for name, (lat, lon) in FIXED.items():
+              todo.setdefault(f'{lat:.2f},{lon:.2f}', (name, lat, lon))
+          for p in places:
+              todo.setdefault(f"{p['lat']:.2f},{p['lon']:.2f}", (p['name'], p['lat'], p['lon']))
+          out = {'fetchedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+                 'places': places, 'points': {}}
+          fails = 0
+          for key, (name, lat, lon) in todo.items():
+              url = f'{FEED}?lat={lat:.2f}&lng={lon:.2f}'
+              try:
+                  req = urllib.request.Request(url, headers={'User-Agent': 'itv-weather-prototype-snapshot'})
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      out['points'][key] = {'name': name, 'feed': json.load(r)}
+              except Exception as e:
+                  fails += 1
+                  print('FAIL', name, e)
+              time.sleep(0.3)               # be gentle with the production feed
+          print(f"{len(out['points'])} ok, {fails} failed")
+          if not out['points']:
+              raise SystemExit('feed unreachable for every point; keeping the previous snapshot')
+          with open('feed-snapshot.json', 'w') as f:
+              json.dump(out, f, separators=(',', ':'))
+          PY
+
+      - name: Commit if changed
+        run: |
+          git config user.name  'feed-snapshot-bot'
+          git config user.email 'feed-snapshot-bot@users.noreply.github.com'
+          cp feed-snapshot.json "$RUNNER_TEMP/feed-snapshot.json"
+          # another run or a manual edit may have pushed while this one was
+          # fetching: start from the latest main each time, and retry
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git reset --hard origin/main
+            cp "$RUNNER_TEMP/feed-snapshot.json" feed-snapshot.json
+            git add feed-snapshot.json
+            if git diff --cached --quiet; then echo 'snapshot unchanged'; exit 0; fi
+            git commit -m "Feed snapshot $(date -u +%FT%TZ)"
+            if git push origin HEAD:main; then exit 0; fi
+            echo "push rejected, retrying ($attempt)"; sleep 5
+          done
+          exit 1
